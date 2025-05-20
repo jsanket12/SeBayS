@@ -1,0 +1,474 @@
+import numpy as np
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+import copy
+
+from rigl_torch.util import get_W, get_W_ERK, get_grad
+
+def gaussian_cdf(x):
+    return 0.5 * (1 + torch.erf(x / np.sqrt(2)))
+
+
+EPS = torch.log(torch.exp(torch.tensor(1e-6)) - 1)
+# EPS = -100.0
+
+class IndexMaskHook:
+    def __init__(self, layer, scheduler):
+        self.layer = layer
+        self.scheduler = scheduler
+        self.dense_grad = None
+
+    def __name__(self):
+        return 'IndexMaskHook'
+
+    @torch.no_grad()
+    def __call__(self, grad):
+        mask = self.scheduler.backward_masks[self.layer]
+
+        # only calculate dense_grads when necessary
+        if self.scheduler.check_if_backward_hook_should_accumulate_grad():
+            if self.dense_grad is None:
+                # initialize as all 0s so we can do a rolling average
+                self.dense_grad = torch.zeros_like(grad)
+            self.dense_grad += grad / self.scheduler.grad_accumulation_n
+        else:
+            self.dense_grad = None
+
+        return grad * mask
+
+
+def _create_step_wrapper(scheduler, optimizer):
+    _unwrapped_step = optimizer.step
+    def _wrapped_step():
+        _unwrapped_step()
+        scheduler.reset_momentum()
+        scheduler.apply_mask_to_weights()
+    optimizer.step = _wrapped_step
+
+
+class RigLScheduler:
+
+    def __init__(self, model, optimizer, dense_allocation=1, T_end=None,
+                 sparsity_distribution='Uniform', ignore_linear_layers=True,
+                 delta=100, alpha=0.3, static_topo=False, grad_accumulation_n=1,
+                 state_dict=None, args=None):
+        if dense_allocation <= 0 or dense_allocation > 1:
+            raise Exception('Dense allocation must be on the interval (0, 1]. Got: %f' % dense_allocation)
+
+        self.model = model
+        self.optimizer = optimizer
+        self.large_death_flag = False
+
+        self.args = args
+
+        self.W, self._linear_layers_mask = get_W(model, return_linear_layers_mask=True, use_bnn=args.use_bnn)
+
+        # modify optimizer.step() function to call "reset_momentum" after
+        _create_step_wrapper(self, optimizer)
+        
+        self.dense_allocation = dense_allocation
+        self.N = [torch.numel(w) for w in self.W]
+
+        if state_dict is not None:
+            self.load_state_dict(state_dict)
+            self.apply_mask_to_weights()
+
+        else:
+            self.sparsity_distribution = sparsity_distribution
+            self.static_topo = static_topo
+            self.grad_accumulation_n = grad_accumulation_n
+            self.ignore_linear_layers = ignore_linear_layers
+            self.backward_masks = None
+
+            # Define sparsity allocation per layer.
+            self.S = []
+            if self.sparsity_distribution == 'Uniform':
+                for i, (W, is_linear) in enumerate(zip(self.W, self._linear_layers_mask)):
+                    # when using uniform sparsity, the first layer is always 100% dense
+                    # UNLESS there is only 1 layer
+                    if not args.use_bnn:
+                        is_first_layer = i == 0
+                    else:
+                        is_first_layer = (i == 0 or i == 1)
+                    if is_first_layer and len(self.W) > 1:
+                        self.S.append(0)
+
+                    elif is_linear and self.ignore_linear_layers:
+                        # if choosing to ignore linear layers, keep them 100% dense
+                        self.S.append(0)
+
+                    else:
+                        self.S.append(1-dense_allocation)
+            elif self.sparsity_distribution == 'ERK':
+                self._layers, self._layer_names, self.W_mean, self.W_std = get_W_ERK(model, use_bnn=args.use_bnn)
+                self._layer_names = []
+                for name, module in model.named_modules():
+                    if isinstance(module, (torch.nn.Linear, torch.nn.Conv2d)):
+                        self._layer_names.append(name)
+                print(self._layers)
+                print(self._layer_names)
+                total_params = 0
+                for layer_weights in self.W_mean:
+                    total_params += layer_weights.numel()
+                is_epsilon_valid = False
+                dense_layers = set()
+                while not is_epsilon_valid:
+                    divisor = 0
+                    rhs = 0
+                    raw_probabilities = {}
+
+                    for layer_name, layer_weights in zip(self._layer_names, self.W_mean):
+                        n_param = np.prod(layer_weights.shape)
+                        n_zeros = n_param * (1 - dense_allocation)
+                        n_ones = n_param * dense_allocation
+
+                        if layer_name in dense_layers:
+                            rhs -= n_zeros
+                        else:
+                            rhs += n_ones
+                            raw_probabilities[layer_name] = np.sum(layer_weights.shape) / np.prod(layer_weights.shape)
+                            divisor += raw_probabilities[layer_name] * n_param
+                    epsilon = rhs / divisor
+                    max_prob = np.max(list(raw_probabilities.values()))
+                    max_prob_one = max_prob * epsilon
+                    if max_prob_one > 1:
+                        is_epsilon_valid = False
+                        for mask_name, mask_raw_prob in raw_probabilities.items():
+                            if mask_raw_prob == max_prob:
+                                print(f"Sparsity of var:{mask_name} had to be set to 0.")
+                                dense_layers.add(mask_name)
+                    else:
+                        is_epsilon_valid = True
+
+                total_nonzero = 0.0
+                for layer_name, layer_weights in zip(self._layer_names, self.W_mean):
+                    n_param = np.prod(layer_weights.shape)
+                    if layer_name in dense_layers:
+                        density_layer = 1.0
+                        self.S.append(0)
+                        self.S.append(0)
+                    else:
+                        density_layer = epsilon * raw_probabilities[layer_name]
+                        self.S.append(1-density_layer)
+                        self.S.append(1-density_layer)
+                    print(f"layer: {layer_name}, shape: {layer_weights.shape}, density: {density_layer}")
+                    total_nonzero += density_layer * layer_weights.numel()
+                print(f"Overall sparsity {total_nonzero / total_params}")
+
+            # randomly sparsify model according to S
+            self.random_sparsify()
+
+            # scheduler keeps a log of how many times it's called. this is how it does its scheduling
+            self.step = 0
+            self.rigl_steps = 0
+
+            # define the actual schedule
+            self.delta_T = delta
+            self.alpha = alpha
+            self.T_end = T_end
+
+        # also, register backward hook so sparse elements cannot be recovered during normal training
+        self.backward_hook_objects = []
+        for i, w in enumerate(self.W):
+            # if sparsity is 0%, skip
+            if self.S[i] <= 0:
+                self.backward_hook_objects.append(None)
+                continue
+            
+            if getattr(w, '_has_rigl_backward_hook', False):
+                raise Exception('This model already has been registered to a RigLScheduler.')
+
+            self.backward_hook_objects.append(IndexMaskHook(i, self))
+            w.register_hook(self.backward_hook_objects[-1])
+            setattr(w, '_has_rigl_backward_hook', True)
+
+        assert self.grad_accumulation_n > 0 and self.grad_accumulation_n < delta
+        assert self.sparsity_distribution in ('Uniform', 'ERK')
+
+    def state_dict(self):
+        return {
+            'dense_allocation': self.dense_allocation,
+            'S': self.S,
+            'N': self.N,
+            'hyperparams': {
+                'delta_T': self.delta_T,
+                'alpha': self.alpha,
+                'T_end': self.T_end,
+                'ignore_linear_layers': self.ignore_linear_layers,
+                'static_topo': self.static_topo,
+                'sparsity_distribution': self.sparsity_distribution,
+                'grad_accumulation_n': self.grad_accumulation_n,
+            },
+            'step': self.step,
+            'rigl_steps': self.rigl_steps,
+            'backward_masks': self.backward_masks,
+            '_linear_layers_mask': self._linear_layers_mask,
+        }
+
+    def load_state_dict(self, state_dict):
+        for k, v in state_dict.items():
+            if isinstance(v, dict):
+                self.load_state_dict(v)
+            else:
+                setattr(self, k, v)
+
+    @torch.no_grad()
+    def random_sparsify(self):
+        is_dist = dist.is_initialized()
+        self.backward_masks = []
+        for l, w in enumerate(self.W):
+            # if sparsity is 0%, skip
+            if self.S[l] <= 0:
+                self.backward_masks.append(None)
+                continue
+            
+            n = self.N[l]
+            s = int(self.S[l] * n)
+            if (not self.args.use_bnn) or (l % 2 == 0):
+                perm = torch.randperm(n)[:s]
+                flat_mask = torch.ones(n, device=w.device)
+                flat_mask[perm] = 0
+                mask = torch.reshape(flat_mask, w.shape)
+
+                if is_dist:
+                    dist.broadcast(mask, 0)
+
+                mask = mask.bool()
+            else:
+                # use same mask as l-1
+                mask = torch.ones(n, device=w.device)
+                mask.data = self.backward_masks[-1].data
+            w.data *= mask.float()
+            self.backward_masks.append(mask)
+
+    @torch.no_grad()
+    def reset_momentum(self):
+        for w, mask, s in zip(self.W, self.backward_masks, self.S):
+            # if sparsity is 0%, skip
+            if s <= 0:
+                continue
+
+            param_state = self.optimizer.state[w]
+            if 'momentum_buffer' in param_state:
+                # mask the momentum matrix
+                buf = param_state['momentum_buffer']
+                buf *= mask.float()
+
+    @torch.no_grad()
+    def apply_mask_to_weights(self):
+        for w, mask, s in zip(self.W, self.backward_masks, self.S):
+            # if sparsity is 0%, skip
+            if s <= 0:
+                continue
+
+            w.data *= mask.float()
+
+    @torch.no_grad()
+    def grow_std_init(self, prev_masks):
+        for l, (w, mask, s, prev_mask) in enumerate(zip(self.W, self.backward_masks, self.S, prev_masks)):
+            # if sparsity is 0%, skip
+            if s <= 0:
+                continue
+            
+            if self.args.use_bnn and (l%2==0):
+                continue
+            
+            if self.args.use_bnn:
+                # ====== abs =====
+                # w.data += (mask!=0) * (prev_mask==0) * torch.mean(torch.abs(w.data)).detach() * w.numel() / torch.sum(w!=0)
+                # ================
+                if self.args.grow_std == 'mean':
+                    mean_val = torch.mean(w.data).detach()
+                    w.data += (mask != 0).float() * (prev_mask == 0).float() * mean_val * w.numel() / torch.sum((w != 0).float())
+                elif self.args.grow_std == 'eps':
+                    w.data += EPS * (mask != 0).float() * (prev_mask == 0).float()
+
+    @torch.no_grad()
+    def apply_mask_to_gradients(self):
+        for w, mask, s in zip(self.W, self.backward_masks, self.S):
+            # if sparsity is 0%, skip
+            if s <= 0:
+                continue
+            if w.grad is not None:
+                w.grad *= mask.float()
+
+    def check_if_backward_hook_should_accumulate_grad(self):
+        
+        if self.step >= self.T_end:
+            return False
+
+        steps_til_next_rigl_step = self.delta_T - (self.step % self.delta_T)
+        return steps_til_next_rigl_step <= self.grad_accumulation_n or self.large_death_flag
+
+    def cosine_annealing(self):
+        return self.alpha / 2 * (1 + np.cos((self.step * np.pi) / self.T_end))
+
+    def check_step_only(self):
+        return ((self.step + 1) % self.delta_T == 0) and (self.step < self.T_end)
+
+    def __call__(self):
+        self.step += 1
+        if self.static_topo:
+            return True
+        if (self.step % self.delta_T) == 0 and self.step < self.T_end:
+            self._rigl_step()
+            self.rigl_steps += 1
+            return False
+        return True
+
+    @torch.no_grad()
+    def _rigl_step(self):
+        drop_fraction = self.cosine_annealing()
+        is_dist = dist.is_initialized()
+        world_size = dist.get_world_size() if is_dist else None
+
+        drop_intersect = 0
+        drop_union = 0
+
+        prev_masks = copy.deepcopy(self.backward_masks)
+
+        for l, w in enumerate(self.W):
+            # if sparsity is 0%, skip
+            if self.S[l] <= 0:
+                continue
+            # For Bayesian models, for paired parameters we use the same mask:
+            if self.args.use_bnn and (l % 2 == 1):
+                self.backward_masks[l].data = self.backward_masks[l - 1].data
+                continue
+
+            current_mask = self.backward_masks[l]
+
+            if self.args.use_bnn:
+                # Compute sigma via softplus for the Bayesian branch.
+                sigma = F.softplus(self.W[l+1]) * (self.W[l+1] != 0)
+
+                if self.args.add_reg_sigma:
+                    sigma += 1e-8 * (w != 0)
+
+            # Choose drop criteria
+            if self.args.drop_criteria == 'mean':
+                score_drop = torch.abs(w)
+            elif self.args.drop_criteria == 'E_mean_abs' and self.args.use_bnn:
+                score_drop = w * torch.erf(w / sigma / np.sqrt(2)) + 2 * sigma * torch.exp(-w**2 / (2 * sigma**2)) / np.sqrt(2 * np.pi)
+                score_drop[score_drop != score_drop] = 0
+            elif self.args.drop_criteria == 'SNR_mean_abs' and self.args.use_bnn:
+                score_drop = w * torch.erf(w / sigma / np.sqrt(2)) + 2 * sigma * torch.exp(-w**2 / (2 * sigma**2)) / np.sqrt(2 * np.pi)
+                score_drop = score_drop / torch.sqrt(sigma**2 + w**2 - score_drop**2)
+                score_drop[score_drop != score_drop] = 0
+            elif self.args.drop_criteria == 'snr' and self.args.use_bnn:
+                score_drop = torch.abs(w) / sigma
+                score_drop[score_drop != score_drop] = 0
+            elif self.args.drop_criteria == 'E_exp_mean_abs' and self.args.use_bnn:
+                lam = self.args.lambda_exp
+                score_drop = (torch.exp(0.5 * (lam ** 2) * (sigma ** 2) + lam * w) *
+                              gaussian_cdf(w / sigma + lam * sigma) +
+                              torch.exp(0.5 * (lam ** 2) * (sigma ** 2) - lam * w) *
+                              gaussian_cdf(-w / sigma + lam * sigma))
+                score_drop[score_drop != score_drop] = 0
+            elif self.args.drop_criteria == 'SNR_exp_mean_abs' and self.args.use_bnn:
+                lam = self.args.lambda_exp
+                E_exp_mean_abs = (torch.exp(0.5 * (lam ** 2) * (sigma ** 2) + lam * w) *
+                                  gaussian_cdf(w / sigma + lam * sigma) +
+                                  torch.exp(0.5 * (lam ** 2) * (sigma ** 2) - lam * w) *
+                                  gaussian_cdf(-w / sigma + lam * sigma))
+                lam = 2 * lam
+                E_exp_mean_abs_2 = (torch.exp(0.5 * (lam ** 2) * (sigma ** 2) + lam * w) *
+                                    gaussian_cdf(w / sigma + lam * sigma) +
+                                    torch.exp(0.5 * (lam ** 2) * (sigma ** 2) - lam * w) *
+                                    gaussian_cdf(-w / sigma + lam * sigma))
+                score_drop = E_exp_mean_abs / torch.sqrt(E_exp_mean_abs_2 - E_exp_mean_abs**2)
+                score_drop[score_drop != score_drop] = 0
+            else:
+                score_drop = torch.abs(w)
+
+            # Use the stored dense gradient for growth score
+            score_grow = torch.abs(self.backward_hook_objects[l].dense_grad)
+
+            # if is distributed, synchronize scores
+            if is_dist:
+                dist.all_reduce(score_drop)  # get the sum of all drop scores
+                score_drop /= world_size     # divide by world size (average the drop scores)
+
+                dist.all_reduce(score_grow)  # get the sum of all grow scores
+                score_grow /= world_size     # divide by world size (average the grow scores)
+
+            n_total = self.N[l]
+            n_ones = int(torch.sum(current_mask).item())
+            n_prune = int(n_ones * drop_fraction)
+            n_keep = n_ones - n_prune
+
+            # Create a drop mask by sorting the drop scores
+            _, sorted_indices = torch.topk(score_drop.view(-1), k=n_total)
+            new_values = torch.where(torch.arange(n_total, device=w.device) < n_keep,
+                                     torch.ones_like(sorted_indices),
+                                     torch.zeros_like(sorted_indices))
+            mask1 = new_values.scatter(0, sorted_indices, new_values)
+
+            # Similarity drop calculation (for logging/analysis)
+            _, sorted_indices_mean = torch.topk(torch.abs(w).view(-1), k=n_total)
+            new_values_mean = torch.where(torch.arange(n_total, device=w.device) < n_keep,
+                                          torch.ones_like(sorted_indices_mean),
+                                          torch.zeros_like(sorted_indices_mean))
+            mask1_mean = new_values_mean.scatter(0, sorted_indices_mean, new_values_mean)
+            mask1_drop = (w != 0).float().view(-1) - mask1
+            mask1_mean_drop = (w != 0).float().view(-1) - mask1_mean
+            drop_intersect += torch.sum(mask1_drop * mask1_mean_drop)
+            drop_union += torch.sum(torch.maximum(mask1_drop, mask1_mean_drop))
+
+            # For growth, lift the scores of currently active weights
+            score_grow = score_grow.view(-1)
+            score_grow_lifted = torch.where(mask1 == 1,
+                                            torch.ones_like(mask1) * (torch.min(score_grow) - 1),
+                                            score_grow)
+            _, sorted_indices = torch.topk(score_grow_lifted, k=n_total)
+            new_values = torch.where(torch.arange(n_total, device=w.device) < n_prune,
+                                     torch.ones_like(sorted_indices),
+                                     torch.zeros_like(sorted_indices))
+            mask2 = new_values.scatter(0, sorted_indices, new_values)
+            mask2_reshaped = torch.reshape(mask2, current_mask.shape)
+            grow_tensor = torch.zeros_like(w)
+            # For this example we choose not to reinitialize weights when regrowing.
+            new_connections = ((mask2_reshaped == 1) & (current_mask == 0))
+            new_weights = torch.where(new_connections.to(w.device), grow_tensor, w)
+            w.data = new_weights
+            mask_combined = torch.reshape(mask1 + mask2, current_mask.shape).bool()
+            current_mask.data = mask_combined
+
+        self.reset_momentum()
+        self.apply_mask_to_weights()
+        self.apply_mask_to_gradients()
+
+        if self.args.use_bnn:
+            self.grow_std_init(prev_masks)
+
+        similarity_drop = drop_intersect / drop_union if drop_union != 0 else 1
+
+##############################################
+# End of RigLScheduler
+##############################################
+
+# You can now integrate this scheduler into your Bayesian ResNet-50 on ImageNet experiment.
+# For example, in your main training script you would create your Bayesian ResNet-50 model,
+# initialize your optimizer, then create an instance of RigLScheduler:
+#
+#    scheduler = RigLScheduler(model, optimizer, dense_allocation=1,
+#                               T_end=TOTAL_STEPS,
+#                               sparsity_distribution='ERK',
+#                               ignore_linear_layers=True,
+#                               delta=YOUR_DELTA,
+#                               alpha=YOUR_ALPHA,
+#                               static_topo=False,
+#                               grad_accumulation_n=GRAD_ACCUM_N,
+#                               args=args)
+#
+# Then, at every training step you call:
+#
+#    if not scheduler():
+#         # A RigL update was performed; you might want to log this event.
+#
+# And after every optimizer step, the scheduler’s wrapped optimizer.step() will ensure
+# that momentum is reset and masks are applied.
+#
+# This code is adapted from your WideResNet CIFAR version but modified for a Bayesian
+# ResNet-50 on ImageNet experiment. Adjust parameters and integration points as necessary.
